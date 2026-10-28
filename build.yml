@@ -1,0 +1,459 @@
+name: Build Glass APK
+on:
+  workflow_dispatch:
+  push:
+jobs:
+  build:
+    runs-on: ubuntu-latest
+    steps:
+      - uses: actions/setup-java@v4
+        with:
+          distribution: temurin
+          java-version: '17'
+      - name: Create project files
+        run: |
+          set -e
+          mkdir -p glass && cd glass
+          mkdir -p $(dirname settings.gradle)
+          cat > settings.gradle <<'GLASS_EOF'
+          pluginManagement { repositories { google(); mavenCentral(); gradlePluginPortal() } }
+          dependencyResolutionManagement {
+              repositories { google(); mavenCentral(); maven { url 'https://jitpack.io' } }
+          }
+          rootProject.name = 'Glass'
+          include ':app'
+          GLASS_EOF
+          mkdir -p $(dirname build.gradle)
+          cat > build.gradle <<'GLASS_EOF'
+          plugins {
+              id 'com.android.application' version '8.2.2' apply false
+              id 'org.jetbrains.kotlin.android' version '1.9.22' apply false
+          }
+          GLASS_EOF
+          mkdir -p $(dirname gradle.properties)
+          cat > gradle.properties <<'GLASS_EOF'
+          org.gradle.jvmargs=-Xmx3g
+          android.useAndroidX=true
+          GLASS_EOF
+          mkdir -p $(dirname app/build.gradle)
+          cat > app/build.gradle <<'GLASS_EOF'
+          plugins {
+              id 'com.android.application'
+              id 'org.jetbrains.kotlin.android'
+          }
+          android {
+              namespace 'com.glass.dl'
+              compileSdk 34
+              defaultConfig {
+                  applicationId 'com.glass.dl'
+                  minSdk 29
+                  targetSdk 34
+                  versionCode 1
+                  versionName '1.0'
+                  ndk { abiFilters 'arm64-v8a' }
+              }
+              compileOptions {
+                  sourceCompatibility JavaVersion.VERSION_17
+                  targetCompatibility JavaVersion.VERSION_17
+              }
+              kotlinOptions { jvmTarget = '17' }
+              packaging { jniLibs { useLegacyPackaging = true } }
+          }
+          dependencies {
+              implementation 'io.github.junkfood02.youtubedl-android:library:0.17.2'
+              implementation 'io.github.junkfood02.youtubedl-android:ffmpeg:0.17.2'
+          }
+          GLASS_EOF
+          mkdir -p $(dirname app/src/main/AndroidManifest.xml)
+          cat > app/src/main/AndroidManifest.xml <<'GLASS_EOF'
+          <?xml version="1.0" encoding="utf-8"?>
+          <manifest xmlns:android="http://schemas.android.com/apk/res/android">
+              <uses-permission android:name="android.permission.INTERNET" />
+              <application
+                  android:label="Glass"
+                  android:extractNativeLibs="true"
+                  android:theme="@android:style/Theme.DeviceDefault.NoActionBar">
+                  <activity
+                      android:name=".MainActivity"
+                      android:exported="true"
+                      android:windowSoftInputMode="adjustResize"
+                      android:configChanges="orientation|screenSize|keyboardHidden">
+                      <intent-filter>
+                          <action android:name="android.intent.action.MAIN" />
+                          <category android:name="android.intent.category.LAUNCHER" />
+                      </intent-filter>
+                  </activity>
+              </application>
+          </manifest>
+          GLASS_EOF
+          mkdir -p $(dirname app/src/main/java/com/glass/dl/MainActivity.kt)
+          cat > app/src/main/java/com/glass/dl/MainActivity.kt <<'GLASS_EOF'
+          package com.glass.dl
+
+          import android.annotation.SuppressLint
+          import android.app.Activity
+          import android.content.ContentValues
+          import android.graphics.Color
+          import android.os.Bundle
+          import android.provider.MediaStore
+          import android.webkit.JavascriptInterface
+          import android.webkit.MimeTypeMap
+          import android.webkit.WebView
+          import android.webkit.WebViewClient
+          import com.yausername.ffmpeg.FFmpeg
+          import com.yausername.youtubedl_android.YoutubeDL
+          import com.yausername.youtubedl_android.YoutubeDLRequest
+          import org.json.JSONArray
+          import org.json.JSONObject
+          import java.net.HttpURLConnection
+          import java.net.URL
+          import java.io.File
+          import java.net.URLEncoder
+          import java.util.concurrent.Executors
+
+          class MainActivity : Activity() {
+              private lateinit var web: WebView
+              private val pool = Executors.newFixedThreadPool(4)
+              @Volatile private var ready = false
+
+              @SuppressLint("SetJavaScriptEnabled")
+              override fun onCreate(b: Bundle?) {
+                  super.onCreate(b)
+                  window.statusBarColor = Color.TRANSPARENT
+                  window.navigationBarColor = Color.BLACK
+                  web = WebView(this)
+                  web.setBackgroundColor(Color.BLACK)
+                  web.settings.javaScriptEnabled = true
+                  web.settings.domStorageEnabled = true
+                  web.addJavascriptInterface(Bridge(), "Android")
+                  web.webViewClient = WebViewClient()
+                  setContentView(web)
+                  web.loadUrl("file:///android_asset/index.html")
+                  pool.execute {
+                      try {
+                          YoutubeDL.getInstance().init(application)
+                          FFmpeg.getInstance().init(application)
+                          ready = true
+                          updateEngine()
+                      } catch (e: Exception) {
+                          js("onErr", "init", e.message ?: "init failed")
+                      }
+                  }
+              }
+
+              @Deprecated("Deprecated in Java")
+              override fun onBackPressed() {
+                  web.evaluateJavascript("window.goBack ? window.goBack() : false") { r ->
+                      if (r != "true") finish()
+                  }
+              }
+
+              private fun js(fn: String, id: String, payload: String) {
+                  web.post {
+                      web.evaluateJavascript(
+                          "window.$fn(${JSONObject.quote(id)},${JSONObject.quote(payload)})", null
+                      )
+                  }
+              }
+
+              private fun ytdl(url: String, opts: List<Pair<String, String?>>): String {
+                  val r = YoutubeDLRequest(url)
+                  for ((k, v) in opts) if (v == null) r.addOption(k) else r.addOption(k, v)
+                  return YoutubeDL.getInstance().execute(r).out
+              }
+
+              private fun updateEngine() {
+                  try {
+                      val yd = YoutubeDL.getInstance()
+                      val m = yd.javaClass.methods.firstOrNull {
+                          it.name == "updateYoutubeDL" && it.parameterCount == 2
+                      } ?: return
+                      val ct = m.parameterTypes[1]
+                      var ch: Any? = ct.fields.firstOrNull { it.name == "STABLE" || it.name == "_STABLE" }?.get(null)
+                      if (ch == null) {
+                          val k = ct.declaredClasses.firstOrNull { it.simpleName == "STABLE" }
+                          ch = k?.getField("INSTANCE")?.get(null)
+                      }
+                      if (ch != null) m.invoke(yd, application, ch)
+                  } catch (_: Throwable) {
+                  }
+              }
+
+              private fun walk(n: Any?, out: JSONArray) {
+                  when (n) {
+                      is JSONObject -> {
+                          n.optJSONObject("videoRenderer")?.let { v ->
+                              val id = v.optString("videoId")
+                              val title = v.optJSONObject("title")?.optJSONArray("runs")
+                                  ?.optJSONObject(0)?.optString("text") ?: ""
+                              val ch = v.optJSONObject("ownerText")?.optJSONArray("runs")
+                                  ?.optJSONObject(0)?.optString("text") ?: ""
+                              val len = v.optJSONObject("lengthText")?.optString("simpleText") ?: ""
+                              var sec = 0
+                              if (len.isNotEmpty()) for (p in len.split(":")) sec = sec * 60 + (p.toIntOrNull() ?: 0)
+                              if (id.isNotEmpty()) out.put(
+                                  JSONObject().put("id", id).put("title", title).put("channel", ch)
+                                      .put("duration", sec)
+                                      .put("url", "https://www.youtube.com/watch?v=$id")
+                              )
+                          }
+                          n.optJSONObject("channelRenderer")?.let { c ->
+                              val id = c.optString("channelId")
+                              val title = c.optJSONObject("title")?.optString("simpleText") ?: ""
+                              var th = c.optJSONObject("thumbnail")?.optJSONArray("thumbnails")
+                                  ?.optJSONObject(0)?.optString("url") ?: ""
+                              if (th.startsWith("//")) th = "https:$th"
+                              if (id.isNotEmpty()) out.put(
+                                  JSONObject().put("id", id).put("title", title)
+                                      .put("url", "https://www.youtube.com/channel/$id")
+                                      .put("thumbnails", JSONArray().put(JSONObject().put("url", th)))
+                              )
+                          }
+                          val it = n.keys()
+                          while (it.hasNext()) walk(n.opt(it.next()), out)
+                      }
+                      is JSONArray -> for (i in 0 until n.length()) walk(n.opt(i), out)
+                  }
+              }
+
+              private fun innertube(q: String, params: String): String {
+                  val body = JSONObject()
+                      .put("context", JSONObject().put("client", JSONObject()
+                          .put("clientName", "WEB").put("clientVersion", "2.20250101.01.00")
+                          .put("hl", "en").put("gl", "US")))
+                      .put("query", q).put("params", params)
+                  val c = URL("https://www.youtube.com/youtubei/v1/search?prettyPrint=false&key=AIzaSyAO_FJ2SlqU8Q4STEHLGCilw_Y9_11qcW8")
+                      .openConnection() as HttpURLConnection
+                  c.requestMethod = "POST"
+                  c.doOutput = true
+                  c.connectTimeout = 15000
+                  c.readTimeout = 20000
+                  c.setRequestProperty("Content-Type", "application/json")
+                  c.setRequestProperty("User-Agent",
+                      "Mozilla/5.0 (Linux; Android 13) AppleWebKit/537.36 Chrome/120.0 Mobile Safari/537.36")
+                  c.outputStream.use { it.write(body.toString().toByteArray()) }
+                  val txt = c.inputStream.bufferedReader().use { it.readText() }
+                  val out = JSONArray()
+                  walk(JSONObject(txt), out)
+                  return JSONObject().put("entries", out).toString()
+              }
+
+              private fun doSearch(arg: String, channels: Boolean): String {
+                  try {
+                      val r = innertube(arg, if (channels) "EgIQAg==" else "EgIQAQ==")
+                      if (JSONObject(r).getJSONArray("entries").length() > 0) return r
+                  } catch (_: Exception) {
+                  }
+                  return if (channels) ytdl(
+                      "https://www.youtube.com/results?search_query=" +
+                          URLEncoder.encode(arg, "UTF-8") + "&sp=EgIQAg%3D%3D",
+                      listOf("--flat-playlist" to null, "-J" to null, "--playlist-end" to "15")
+                  ) else ytdl("ytsearch25:$arg", listOf("--flat-playlist" to null, "-J" to null))
+              }
+
+              private fun download(id: String, url: String, mode: String) {
+                  val dir = File(cacheDir, "dl/${System.currentTimeMillis()}")
+                  dir.mkdirs()
+                  val r = YoutubeDLRequest(url)
+                  r.addOption("--no-playlist")
+                  r.addOption("-o", dir.absolutePath + "/%(title).80s.%(ext)s")
+                  if (mode == "audio") {
+                      r.addOption("-x")
+                      r.addOption("--audio-format", "mp3")
+                  } else {
+                      val h = mode
+                      r.addOption(
+                          "-f",
+                          "bv*[height<=$h][ext=mp4]+ba[ext=m4a]/bv*[height<=$h]+ba/b[height<=$h]/b"
+                      )
+                      r.addOption("--merge-output-format", "mp4")
+                  }
+                  YoutubeDL.getInstance().execute(r, id) { p, _, _ -> js("onProg", id, p.toString()) }
+                  val file = dir.listFiles()
+                      ?.filter { !it.name.endsWith(".part") && !it.name.endsWith(".ytdl") }
+                      ?.maxByOrNull { it.length() } ?: throw Exception("no file")
+                  val ext = file.extension.lowercase()
+                  val mime = MimeTypeMap.getSingleton().getMimeTypeFromExtension(ext)
+                      ?: "application/octet-stream"
+                  val cv = ContentValues().apply {
+                      put(MediaStore.MediaColumns.DISPLAY_NAME, file.name)
+                      put(MediaStore.MediaColumns.MIME_TYPE, mime)
+                      put(MediaStore.MediaColumns.RELATIVE_PATH, "Download/Glass")
+                  }
+                  val uri = contentResolver.insert(MediaStore.Downloads.EXTERNAL_CONTENT_URI, cv)
+                      ?: throw Exception("save failed")
+                  contentResolver.openOutputStream(uri)!!.use { o ->
+                      file.inputStream().use { it.copyTo(o) }
+                  }
+                  dir.deleteRecursively()
+                  js("onRes", id, file.name)
+              }
+
+              inner class Bridge {
+                  @JavascriptInterface
+                  fun run(id: String, kind: String, arg: String, extra: String) {
+                      pool.execute {
+                          try {
+                              var t = 0
+                              while (!ready && t < 150) { Thread.sleep(200); t++ }
+                              if (!ready) throw Exception("المحرك لسه بيشتغل، جرب كمان ثواني")
+                              when (kind) {
+                                  "search" -> js("onRes", id, doSearch(arg, false))
+                                  "channels" -> js("onRes", id, doSearch(arg, true))
+                                  "channel" -> js("onRes", id, ytdl(arg.trimEnd('/') + "/videos",
+                                      listOf("--flat-playlist" to null, "-J" to null,
+                                          "--playlist-end" to "30")))
+                                  "info" -> js("onRes", id, ytdl(arg,
+                                      listOf("-J" to null, "--no-playlist" to null)))
+                                  "dl" -> download(id, arg, extra)
+                              }
+                          } catch (e: Exception) {
+                              js("onErr", id, e.message ?: "error")
+                          }
+                      }
+                  }
+              }
+          }
+          GLASS_EOF
+          mkdir -p $(dirname app/src/main/assets/index.html)
+          cat > app/src/main/assets/index.html <<'GLASS_EOF'
+          <!DOCTYPE html>
+          <html lang="ar" dir="rtl"><head><meta charset="utf-8">
+          <meta name="viewport" content="width=device-width,initial-scale=1,viewport-fit=cover">
+          <style>
+          *{box-sizing:border-box;-webkit-tap-highlight-color:transparent}
+          html,body{margin:0;height:100%;background:#05060f;color:#fff;font-family:system-ui,sans-serif;overflow:hidden}
+          .bg{position:fixed;inset:0;overflow:hidden;z-index:0}
+          .bg i{position:absolute;border-radius:50%;filter:blur(70px);opacity:.75;animation:fl 14s ease-in-out infinite alternate}
+          .bg i:nth-child(1){width:300px;height:300px;background:#7c3aed;top:-80px;right:-60px}
+          .bg i:nth-child(2){width:280px;height:280px;background:#06b6d4;bottom:80px;left:-90px;animation-delay:-5s}
+          .bg i:nth-child(3){width:220px;height:220px;background:#ec4899;top:45%;right:20%;animation-delay:-9s}
+          @keyframes fl{to{transform:translate(40px,-50px) scale(1.2)}}
+          .glass{background:rgba(255,255,255,.09);backdrop-filter:blur(22px) saturate(170%);-webkit-backdrop-filter:blur(22px) saturate(170%);border:1px solid rgba(255,255,255,.18);box-shadow:inset 0 1px 0 rgba(255,255,255,.28),0 8px 32px rgba(0,0,0,.35);border-radius:22px}
+          #app{position:relative;z-index:1;height:100%;display:flex;flex-direction:column;padding-top:env(safe-area-inset-top,24px)}
+          .top{padding:14px 14px 6px}
+          .sb{display:flex;gap:8px;padding:6px;align-items:center}
+          .sb input{flex:1;min-width:0;background:none;border:0;outline:0;color:#fff;font-size:16px;padding:10px 12px}
+          .sb input::placeholder{color:rgba(255,255,255,.5)}
+          .btn{border:0;color:#fff;border-radius:16px;padding:10px 16px;font-size:15px;background:linear-gradient(135deg,rgba(124,58,237,.9),rgba(6,182,212,.9));box-shadow:0 4px 16px rgba(124,58,237,.4)}
+          .main{flex:1;overflow-y:auto;padding:8px 14px 110px}
+          .card{display:flex;gap:12px;padding:10px;margin-bottom:10px;align-items:center}
+          .th{width:116px;height:66px;border-radius:14px;object-fit:cover;background:rgba(255,255,255,.1);flex:none}
+          .th.ch{width:66px;border-radius:50%}
+          .in{flex:1;min-width:0}
+          .tt{font-size:14px;line-height:1.35;max-height:38px;overflow:hidden}
+          .sub{font-size:12px;opacity:.65;margin-top:4px}
+          .acts{display:flex;flex-direction:column;gap:6px}
+          .ic{width:40px;height:34px;border-radius:12px;border:1px solid rgba(255,255,255,.2);background:rgba(255,255,255,.12);color:#fff;font-size:16px}
+          .nav{position:fixed;z-index:5;left:16px;right:16px;bottom:calc(14px + env(safe-area-inset-bottom,0px));display:flex;padding:6px}
+          .nav button{flex:1;border:0;background:none;color:rgba(255,255,255,.6);padding:10px 0;border-radius:18px;font-size:14px}
+          .nav button.on{background:rgba(255,255,255,.17);color:#fff;box-shadow:inset 0 1px 0 rgba(255,255,255,.3)}
+          .empty{text-align:center;opacity:.55;margin-top:60px;line-height:1.8}
+          .sheet{position:fixed;inset:0;z-index:10;background:rgba(0,0,0,.5);display:none;align-items:flex-end}
+          .sheet.show{display:flex}
+          .sheet .box{width:100%;padding:18px 16px calc(24px + env(safe-area-inset-bottom,0px));border-radius:28px 28px 0 0}
+          .chips{display:flex;flex-wrap:wrap;gap:8px;margin-top:14px}
+          .chip{border:1px solid rgba(255,255,255,.22);background:rgba(255,255,255,.12);color:#fff;border-radius:14px;padding:10px 16px;font-size:15px}
+          .bar{height:6px;border-radius:6px;background:rgba(255,255,255,.15);margin-top:8px;overflow:hidden}
+          .bar b{display:block;height:100%;width:0;background:linear-gradient(90deg,#7c3aed,#06b6d4);transition:width .3s}
+          .back{margin-bottom:10px}
+          </style></head><body>
+          <div class="bg"><i></i><i></i><i></i></div>
+          <div id="app">
+           <div class="top" id="top"><div class="glass sb"><input id="q" placeholder="ابحث عن فيديو أو أغنية أو الصق رابط" enterkeyhint="search"><button class="btn" id="go">بحث</button></div></div>
+           <div class="main" id="main"></div>
+          </div>
+          <div class="nav glass"><button data-t="v" class="on">🔍 بحث</button><button data-t="c">📺 قنوات</button><button data-t="d">⬇️ تنزيلات</button></div>
+          <div class="sheet" id="sheet"><div class="box glass" id="box"></div></div>
+          <script>
+          const $=s=>document.querySelector(s);
+          let tab='v',n=0,P={},DL=[],view=null,chanStack=null;
+          window.onRes=(id,p)=>{P[id]&&P[id].res(p);delete P[id]};
+          window.onErr=(id,m)=>{P[id]&&P[id].rej(new Error(m));delete P[id]};
+          window.onProg=(id,p)=>{const d=DL.find(x=>x.id==id);if(d){d.pct=Math.max(0,Math.min(100,parseFloat(p)||0));const b=document.getElementById('b'+id);if(b)b.style.width=d.pct+'%'}};
+          function run(kind,arg,extra=''){return new Promise((res,rej)=>{const id=String(++n);P[id]={res,rej};Android.run(id,kind,arg,extra)}).then(JSON.parse)}
+          const esc=s=>String(s||'').replace(/[&<>"]/g,c=>({'&':'&amp;','<':'&lt;','>':'&gt;','"':'&quot;'}[c]));
+          const dur=s=>{if(!s)return'';s=Math.round(s);const h=s/3600|0,m=(s%3600)/60|0,x=s%60;return(h?h+':'+String(m).padStart(2,'0'):m)+':'+String(x).padStart(2,'0')};
+          const thumb=e=>{let t=e.thumbnails&&e.thumbnails.length?e.thumbnails[e.thumbnails.length-1].url:'';if(t&&t.startsWith('//'))t='https:'+t;return t||(e.id?`https://i.ytimg.com/vi/${e.id}/mqdefault.jpg`:'')};
+          const msg=t=>`<div class="empty">${t}</div>`;
+          function setMain(h){$('#main').innerHTML=h}
+          function render(){
+           $('#top').style.display=tab==='d'?'none':'';
+           $('#q').placeholder=tab==='c'?'ابحث عن قناة':'ابحث عن فيديو أو أغنية أو الصق رابط';
+           document.querySelectorAll('.nav button').forEach(b=>b.classList.toggle('on',b.dataset.t===tab));
+           if(tab==='d')return renderDL();
+           if(tab==='c'&&chanStack)return list(chanStack.items,'v',chanStack.name);
+           if(view&&view.tab===tab)return list(view.items,tab);
+           setMain(msg(tab==='c'?'ابحث عن أي قناة 📺':'ابحث وحمّل أي فيديو أو أغنية ✨'));
+          }
+          function list(items,kind,title){
+           window.cur=items;
+           let h=title?`<button class="chip back" onclick="goBack()">→ رجوع</button><div style="margin:0 4px 10px;font-weight:600">${esc(title)}</div>`:'';
+           if(!items.length)h+=msg('مفيش نتائج');
+           items.forEach((e,i)=>{
+            const isCh=kind==='c';
+            h+=`<div class="glass card"><img class="th ${isCh?'ch':''}" src="${esc(thumb(e))}" onerror="this.style.visibility='hidden'">
+            <div class="in" ${isCh?`onclick="openCh(${i})"`:''}><div class="tt">${esc(e.title||e.channel)}</div><div class="sub">${isCh?'اضغط لعرض الفيديوهات':esc(e.channel||e.uploader||'')+(e.duration?' • '+dur(e.duration):'')}</div></div>
+            <div class="acts">${isCh?`<button class="ic" onclick="openCh(${i})">◀</button>`:`<button class="ic" onclick="pick(${i})">⬇️</button><button class="ic" onclick="startDL(${i},'audio')">🎵</button>`}</div></div>`});
+           setMain(h);
+          }
+          const vurl=e=>e.url&&e.url.startsWith('http')?e.url:`https://www.youtube.com/watch?v=${e.id}`;
+          async function doSearch(){
+           const q=$('#q').value.trim();if(!q)return;
+           chanStack=null;setMain(msg('جاري البحث...'));
+           try{
+            if(/^https?:\/\//.test(q)){const i=await run('info',q);view={tab,items:[{id:i.id,title:i.title,channel:i.uploader,duration:i.duration,url:q,thumbnails:i.thumbnail?[{url:i.thumbnail}]:[]}]}}
+            else{const r=await run(tab==='c'?'channels':'search',q);view={tab,items:(r.entries||[]).filter(Boolean)}}
+            render();
+           }catch(e){setMain(msg('حصل خطأ: '+esc(e.message)))}
+          }
+          async function openCh(i){
+           const c=window.cur[i];let u=c.url||c.channel_url;if(!u)return;
+           setMain(msg('جاري تحميل الفيديوهات...'));
+           try{const r=await run('channel',u);chanStack={name:c.title,items:(r.entries||[]).filter(Boolean),prev:view};render()}
+           catch(e){setMain(msg('حصل خطأ: '+esc(e.message)))}
+          }
+          window.goBack=()=>{
+           if($('#sheet').classList.contains('show')){$('#sheet').classList.remove('show');return true}
+           if(chanStack){chanStack=null;render();return true}
+           return false};
+          function pick(i){
+           const e=window.cur[i];const box=$('#box');$('#sheet').classList.add('show');
+           box.innerHTML=`<div class="tt" style="max-height:none">${esc(e.title)}</div><div class="sub">جاري جلب الجودات...</div>`;
+           run('info',vurl(e)).then(inf=>{
+            const hs=[...new Set((inf.formats||[]).filter(f=>f.height&&f.vcodec&&f.vcodec!=='none').map(f=>f.height))].sort((a,b)=>b-a);
+            box.innerHTML=`<div class="tt" style="max-height:none">${esc(e.title)}</div><div class="sub">اختار الجودة</div><div class="chips">`+
+             hs.map(h=>`<button class="chip" onclick="startDL(${i},'${h}')">🎬 ${h}p</button>`).join('')+
+             `<button class="chip" onclick="startDL(${i},'audio')">🎵 MP3</button></div>`;
+           }).catch(er=>{box.innerHTML=`<div class="empty">${esc(er.message)}</div>`});
+          }
+          function startDL(i,mode){
+           const e=window.cur[i];$('#sheet').classList.remove('show');
+           const d={id:'',title:e.title,thumb:thumb(e),mode,pct:0,st:'run'};
+           const id=String(n+1);d.id=id;DL.unshift(d);
+           run('dl',vurl(e),mode).then(f=>{d.st='ok';d.pct=100;d.file=f;if(tab==='d')renderDL()}).catch(er=>{d.st='err';d.err=er.message;if(tab==='d')renderDL()});
+           const t=document.querySelector('.nav button[data-t=d]');t.textContent='⬇️ تنزيلات ('+DL.length+')';
+          }
+          function renderDL(){
+           if(!DL.length)return setMain(msg('مفيش تنزيلات لسه'));
+           setMain(DL.map(d=>`<div class="glass card"><img class="th" src="${esc(d.thumb)}"><div class="in"><div class="tt">${esc(d.title)}</div>
+           <div class="sub">${d.st==='ok'?'✅ اتحفظ في Download/Glass':d.st==='err'?'❌ '+esc(d.err):(d.mode==='audio'?'MP3':d.mode+'p')+' • جاري التنزيل...'}</div>
+           ${d.st==='run'?`<div class="bar"><b id="b${d.id}" style="width:${d.pct}%"></b></div>`:''}</div></div>`).join(''));
+          }
+          $('#go').onclick=doSearch;$('#q').onkeydown=e=>{if(e.key==='Enter')doSearch()};
+          $('#sheet').onclick=e=>{if(e.target.id==='sheet')$('#sheet').classList.remove('show')};
+          document.querySelectorAll('.nav button').forEach(b=>b.onclick=()=>{tab=b.dataset.t;render()});
+          render();
+          </script></body></html>
+          GLASS_EOF
+
+      - uses: gradle/actions/setup-gradle@v3
+        with:
+          gradle-version: '8.2'
+      - name: Build
+        working-directory: glass
+        run: gradle assembleDebug --no-daemon
+      - uses: actions/upload-artifact@v4
+        with:
+          name: Glass-APK
+          path: glass/app/build/outputs/apk/debug/app-debug.apk
